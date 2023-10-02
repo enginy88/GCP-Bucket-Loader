@@ -1,0 +1,4 @@
+.DS_Store
+*.json
+GCP-Bucket-Uploader
+bin/
