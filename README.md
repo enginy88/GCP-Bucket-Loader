@@ -1,3 +1,3 @@
-# GCP-BUCKET-UPLOADER
+# GCP-BUCKET-LOADER
 
-A Go utility program to upload local files to GCP Bucket.
+A Go utility program for uploading and downloading files to or from a GCP Bucket.
