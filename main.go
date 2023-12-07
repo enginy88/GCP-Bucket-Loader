@@ -94,7 +94,7 @@ func parseAppFlag() {
 func main() {
 
 	start := time.Now()
-	LogAlways.Println("HELLO MSG: Welcome to GCP-Bucket-Loader v2.0 by EY!")
+	LogAlways.Println("HELLO MSG: Welcome to GCP-Bucket-Loader v2.1 by EY!")
 
 	appFlag = GetAppFlag()
 
