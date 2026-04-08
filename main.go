@@ -26,7 +26,7 @@ const (
 	Download = "download"
 
 	defaultBufferKB   = 256
-	defaultTimeoutSec = 60
+	defaultTimeoutSec = 120
 )
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
