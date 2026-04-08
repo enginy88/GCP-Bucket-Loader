@@ -182,9 +182,16 @@ func getBufferSizeBytes() int {
 	return size
 }
 
+func effectiveBufferKB() int {
+	if appFlag.BufferSize <= 0 {
+		return defaultBufferKB
+	}
+	return appFlag.BufferSize
+}
+
 func closeWithWarn(c io.Closer, label string) {
 	if err := c.Close(); err != nil {
-		LogWarn.Println("WARNING: Cannot close " + label + ": " + err.Error())
+		LogWarn.Println("Cannot close " + label + ": " + err.Error())
 	}
 }
 
@@ -225,7 +232,7 @@ func main() {
 		LogErr.Fatalln("FATAL ERROR: Key parameter is mandatory when public is not set!")
 	}
 	if appFlag.PublicRequest && appFlag.KeyPath != "" {
-		LogWarn.Println("WARNING: Key parameter is unnessary and discarded when public is set!")
+		LogWarn.Println("Key parameter is unnecessary and discarded when public is set!")
 	}
 
 	if multiFile && strings.EqualFold(appFlag.ActionType, Download) {
@@ -242,7 +249,7 @@ func main() {
 	if !appFlag.NoCompress {
 		LogInfo.Println("Gzip compression is enabled (use -no-compress to disable).")
 	}
-	LogInfo.Println(fmt.Sprintf("I/O buffer size: %d KB", appFlag.BufferSize))
+	LogInfo.Println(fmt.Sprintf("I/O buffer size: %d KB", effectiveBufferKB()))
 
 	storageUnderlyingDataObject := new(storageUnderlyingDataStruct)
 	storageUnderlyingDataObject.ctx, storageUnderlyingDataObject.cancel = createContext(appFlag.TimeoutValue)
@@ -250,9 +257,10 @@ func main() {
 	storageUnderlyingDataObject.client = createClient(storageUnderlyingDataObject.ctx, appFlag.PublicRequest, appFlag.KeyPath)
 	defer storageUnderlyingDataObject.client.Close()
 
+	uploadFailed := 0
 	if strings.EqualFold(appFlag.ActionType, Upload) {
 		if multiFile {
-			processMultiFileUpload(storageUnderlyingDataObject, files, appFlag.BucketName, appFlag.ObjectPath, appFlag.ContentType, appFlag.Workers, appFlag.FileTimeoutValue)
+			uploadFailed = processMultiFileUpload(storageUnderlyingDataObject, files, appFlag.BucketName, appFlag.ObjectPath, appFlag.ContentType, appFlag.Workers, appFlag.FileTimeoutValue)
 		} else {
 			objPath := appFlag.ObjectPath
 			if objPath == "" {
@@ -277,6 +285,9 @@ func main() {
 	duration := fmt.Sprintf("%.1f", time.Since(start).Seconds())
 	LogAlways.Println("BYE MSG: All done in " + duration + "s, bye!")
 
+	if uploadFailed > 0 {
+		os.Exit(1)
+	}
 }
 
 func createContext(timeoutValue int) (context.Context, context.CancelFunc) {
@@ -324,7 +335,7 @@ func deriveMultiFileObjectPath(objectPath, filePath string) string {
 	return deriveObjectPath(filePath)
 }
 
-func processMultiFileUpload(storageData *storageUnderlyingDataStruct, files []string, bucketName, objectPath, contentType string, workers uint, fileTimeout int) {
+func processMultiFileUpload(storageData *storageUnderlyingDataStruct, files []string, bucketName, objectPath, contentType string, workers uint, fileTimeout int) int {
 	LogInfo.Println(fmt.Sprintf("Multi-file upload: %d files detected.", len(files)))
 
 	if objectPath == "" {
@@ -386,8 +397,9 @@ func processMultiFileUpload(storageData *storageUnderlyingDataStruct, files []st
 	LogInfo.Println(fmt.Sprintf("Multi-file upload complete: %d/%d succeeded, %d failed.", succeeded, len(files), failed))
 
 	if failed > 0 {
-		LogWarn.Println(fmt.Sprintf("WARNING: %d file(s) failed to upload. Check warnings above for details.", failed))
+		LogWarn.Println(fmt.Sprintf("%d file(s) failed to upload. Check warnings above for details.", failed))
 	}
+	return failed
 }
 
 func uploadFile(storageUnderlyingDataObject *storageUnderlyingDataStruct, filePath string, bucketName string, objectPath string, contentType string, multiFile bool, fileTimeout int) error {
