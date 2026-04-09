@@ -25,8 +25,9 @@ const (
 	Upload   = "upload"
 	Download = "download"
 
-	defaultBufferKB   = 256
-	defaultTimeoutSec = 120
+	defaultBufferKB = 256
+	defaultWorkers  = 0
+	appVersion      = "v3.0"
 )
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
@@ -91,10 +92,10 @@ func parseAppFlag() {
 	extraChecks := flag.Bool("extra", false, "Perform extra bucket/object checks on GCP and enable CRC32C verification on download. (Optional)")
 	publicRequest := flag.Bool("public", false, "Can be set as 'true' to perform unauthenticated connection to GCP. (Optional)")
 	noCompress := flag.Bool("no-compress", false, "Disable gzip compression for transfers. Compression is enabled by default. (Optional)")
-	timeoutValue := flag.Int("timeout", 0, "Total timeout in seconds (default 60s) for the entire operation. (Optional)")
-	fileTimeoutValue := flag.Int("file-timeout", 0, "Per-file timeout in seconds for multi-file operations. 0 (default) means no per-file limit, only the total timeout applies. (Optional)")
+	timeoutValue := flag.Int("timeout", 0, "Total timeout in seconds for the entire operation. 0 or omitted means no limit. (Optional)")
+	fileTimeoutValue := flag.Int("file-timeout", 0, "Per-file timeout in seconds for multi-file uploads. 0 (default) means no per-file limit; -timeout still applies when set. (Optional)")
 	bufferSize := flag.Int("buffer", defaultBufferKB, "I/O buffer size in KB. (Optional)")
-	workers := flag.Uint("workers", 0, "Number of concurrent workers for multi-file upload. 0 (default) for sequential execution, N>0 for concurrent with N workers. (Optional)")
+	workers := flag.Uint("workers", defaultWorkers, "Number of concurrent workers for multi-file upload. 0 (default) for sequential execution, N>0 for concurrent with N workers. (Optional)")
 
 	flag.Parse()
 
@@ -206,7 +207,7 @@ func computeCRC32C(r io.Reader) (uint32, error) {
 func main() {
 
 	start := time.Now()
-	LogAlways.Println("HELLO MSG: Welcome to GCP-Bucket-Loader v3.0 by EY!")
+	LogAlways.Println("HELLO MSG: Welcome to GCP-Bucket-Loader " + appVersion + " by EY!")
 
 	appFlag = GetAppFlag()
 
@@ -291,19 +292,11 @@ func main() {
 }
 
 func createContext(timeoutValue int) (context.Context, context.CancelFunc) {
-
-	var timeoutDuration time.Duration
-	if timeoutValue <= 0 {
-		timeoutDuration = time.Second * defaultTimeoutSec
-	} else {
-		timeoutDuration = time.Second * time.Duration(timeoutValue)
-	}
-
 	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, timeoutDuration)
-
-	return ctx, cancel
-
+	if timeoutValue <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, time.Second*time.Duration(timeoutValue))
 }
 
 func createClient(ctx context.Context, publicRequest bool, keyPath string) *storage.Client {

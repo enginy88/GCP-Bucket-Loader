@@ -28,8 +28,8 @@ make clean      # remove the bin/ directory
 | `-extra` | bool | `false` | Enable extra API checks (bucket/object existence, post-upload verification, CRC32C validation on download). |
 | `-no-compress` | bool | `false` | Disable gzip compression. Compression is **on** by default. |
 | `-buffer` | int | `256` | I/O buffer size in KB. |
-| `-timeout` | int | `60` | Total operation timeout in seconds. |
-| `-file-timeout` | int | `0` | Per-file timeout in seconds for multi-file uploads. `0` = no per-file limit. |
+| `-timeout` | int | — | Total operation timeout in seconds. Omit or pass `0` for **no** overall limit (runs until completion). |
+| `-file-timeout` | int | `0` | Per-file timeout in seconds for multi-file uploads. `0` = no per-file limit; `-timeout` still caps the whole run when set. |
 | `-workers` | uint | `0` | Concurrent workers for multi-file upload. `0` = sequential. |
 
 ---
@@ -119,6 +119,8 @@ GCP-Bucket-Loader -action download -bucket my-bucket -key sa.json \
 ```
 
 ### Custom buffer and timeout
+
+By default there is no overall time limit; set `-timeout` when you need a deadline (seconds).
 
 ```bash
 GCP-Bucket-Loader -action upload -bucket my-bucket -key sa.json \
