@@ -25,9 +25,10 @@ const (
 	Upload   = "upload"
 	Download = "download"
 
-	defaultBufferKB = 256
-	defaultWorkers  = 0
-	appVersion      = "v3.0"
+	defaultBufferKB   = 256
+	defaultWorkers    = 0
+	defaultRetryCount = 0
+	appVersion        = "v4.0"
 )
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
@@ -46,9 +47,10 @@ type AppFlagStruct struct {
 	FileTimeoutValue int
 	BufferSize       int
 	Workers          uint
+	RetryCount       int
 }
 
-type storageUnderlyingDataStruct struct {
+type gcsSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	client *storage.Client
@@ -71,14 +73,9 @@ func init() {
 var appFlag *AppFlagStruct
 
 func GetAppFlag() *AppFlagStruct {
-
-	appFlagObject := new(AppFlagStruct)
-	appFlag = appFlagObject
-
+	appFlag = &AppFlagStruct{}
 	parseAppFlag()
-
 	return appFlag
-
 }
 
 func parseAppFlag() {
@@ -96,10 +93,11 @@ func parseAppFlag() {
 	fileTimeoutValue := flag.Int("file-timeout", 0, "Per-file timeout in seconds for multi-file uploads. 0 (default) means no per-file limit; -timeout still applies when set. (Optional)")
 	bufferSize := flag.Int("buffer", defaultBufferKB, "I/O buffer size in KB. (Optional)")
 	workers := flag.Uint("workers", defaultWorkers, "Number of concurrent workers for multi-file upload. 0 (default) for sequential execution, N>0 for concurrent with N workers. (Optional)")
+	retryCount := flag.Int("retry", defaultRetryCount, "Number of retry attempts for GCP/network operations on failure. 0 (default) means no retry. (Optional)")
 
 	flag.Parse()
 
-	appFlag.ActionType = *actionType
+	appFlag.ActionType = strings.ToLower(*actionType) // normalize so == comparisons work everywhere
 	appFlag.FilePath = *filePath
 	appFlag.BucketName = *bucketName
 	appFlag.ObjectPath = *objectPath
@@ -112,6 +110,7 @@ func parseAppFlag() {
 	appFlag.FileTimeoutValue = *fileTimeoutValue
 	appFlag.BufferSize = *bufferSize
 	appFlag.Workers = *workers
+	appFlag.RetryCount = *retryCount
 
 }
 
@@ -145,6 +144,9 @@ func resolveFiles(fileFlag string) ([]string, error) {
 				files = append(files, p)
 			}
 		}
+		if len(files) == 0 {
+			return nil, fmt.Errorf("no file paths found in comma-separated list %q", fileFlag)
+		}
 	} else {
 		files = append(files, fileFlag)
 	}
@@ -175,14 +177,6 @@ func deriveObjectPath(filePath string) string {
 	return objPath
 }
 
-func getBufferSizeBytes() int {
-	size := appFlag.BufferSize * 1024
-	if size <= 0 {
-		return defaultBufferKB * 1024
-	}
-	return size
-}
-
 func effectiveBufferKB() int {
 	if appFlag.BufferSize <= 0 {
 		return defaultBufferKB
@@ -190,10 +184,30 @@ func effectiveBufferKB() int {
 	return appFlag.BufferSize
 }
 
+func getBufferSizeBytes() int {
+	return effectiveBufferKB() * 1024
+}
+
 func closeWithWarn(c io.Closer, label string) {
 	if err := c.Close(); err != nil {
 		LogWarn.Println("Cannot close " + label + ": " + err.Error())
 	}
+}
+
+// withRetry runs op up to 1+retryCount times, sleeping 1s between attempts.
+func withRetry(retryCount int, op func() error) error {
+	var err error
+	for attempt := 0; attempt <= retryCount; attempt++ {
+		if attempt > 0 {
+			LogWarn.Printf("Retry attempt %d/%d after error: %s", attempt, retryCount, err.Error())
+			time.Sleep(time.Second)
+		}
+		err = op()
+		if err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 func computeCRC32C(r io.Reader) (uint32, error) {
@@ -204,6 +218,27 @@ func computeCRC32C(r io.Reader) (uint32, error) {
 	return h.Sum32(), nil
 }
 
+// checkBucketExists fetches bucket attrs (with retry) to verify the bucket is accessible.
+func checkBucketExists(ctx context.Context, bkt *storage.BucketHandle) error {
+	return withRetry(appFlag.RetryCount, func() error {
+		_, e := bkt.Attrs(ctx)
+		return e
+	})
+}
+
+// handleUploadError logs and either returns (multiFile) or fatals (single file).
+func handleUploadError(multiFile bool, msg string, err error) error {
+	if err == nil {
+		err = errors.New(msg)
+	}
+	if multiFile {
+		LogWarn.Println(msg + " Skipping.")
+		return err
+	}
+	LogErr.Fatalln(msg)
+	return nil // unreachable
+}
+
 func main() {
 
 	start := time.Now()
@@ -212,32 +247,29 @@ func main() {
 	appFlag = GetAppFlag()
 
 	if appFlag.ActionType == "" || appFlag.FilePath == "" || appFlag.BucketName == "" {
-		LogErr.Fatalln("FATAL ERROR: Action, file, and bucket parameters must be filled!")
+		LogErr.Fatalln("Action, file, and bucket parameters must be filled!")
 	}
 
 	if flag.NArg() > 0 {
-		LogWarn.Println("WARNING: Unexpected positional arguments detected and ignored: " + strings.Join(flag.Args(), ", "))
+		LogWarn.Println("Unexpected positional arguments detected and ignored: " + strings.Join(flag.Args(), ", "))
 	}
 
 	files, err := resolveFiles(appFlag.FilePath)
 	if err != nil {
-		LogErr.Fatalln("FATAL ERROR: " + err.Error())
-	}
-	if len(files) == 0 {
-		LogErr.Fatalln("FATAL ERROR: No input files specified!")
+		LogErr.Fatalln(err.Error())
 	}
 
 	multiFile := len(files) > 1
 
 	if !appFlag.PublicRequest && appFlag.KeyPath == "" {
-		LogErr.Fatalln("FATAL ERROR: Key parameter is mandatory when public is not set!")
+		LogErr.Fatalln("Key parameter is mandatory when public is not set!")
 	}
 	if appFlag.PublicRequest && appFlag.KeyPath != "" {
-		LogWarn.Println("Key parameter is unnecessary and discarded when public is set!")
+		LogWarn.Println("Key parameter is unnecessary and discarded when public is set.")
 	}
 
-	if multiFile && strings.EqualFold(appFlag.ActionType, Download) {
-		LogErr.Fatalln("FATAL ERROR: Multi-file download is not supported! Use single file mode.")
+	if multiFile && appFlag.ActionType == Download {
+		LogErr.Fatalln("Multi-file download is not supported! Use single file mode.")
 	}
 
 	if !multiFile && appFlag.Workers > 0 {
@@ -250,45 +282,46 @@ func main() {
 	if !appFlag.NoCompress {
 		LogInfo.Println("Gzip compression is enabled (use -no-compress to disable).")
 	}
-	LogInfo.Println(fmt.Sprintf("I/O buffer size: %d KB", effectiveBufferKB()))
+	LogInfo.Printf("I/O buffer size: %d KB", effectiveBufferKB())
 
-	storageUnderlyingDataObject := new(storageUnderlyingDataStruct)
-	storageUnderlyingDataObject.ctx, storageUnderlyingDataObject.cancel = createContext(appFlag.TimeoutValue)
-	defer storageUnderlyingDataObject.cancel()
-	storageUnderlyingDataObject.client = createClient(storageUnderlyingDataObject.ctx, appFlag.PublicRequest, appFlag.KeyPath)
-	defer storageUnderlyingDataObject.client.Close()
+	session := new(gcsSession)
+	session.ctx, session.cancel = createContext(appFlag.TimeoutValue)
+	defer session.cancel()
+	session.client = createClient(session.ctx, appFlag.PublicRequest, appFlag.KeyPath)
+	defer session.client.Close()
 
 	uploadFailed := 0
-	if strings.EqualFold(appFlag.ActionType, Upload) {
+	if appFlag.ActionType == Upload {
 		if multiFile {
-			uploadFailed = processMultiFileUpload(storageUnderlyingDataObject, files, appFlag.BucketName, appFlag.ObjectPath, appFlag.ContentType, appFlag.Workers, appFlag.FileTimeoutValue)
+			uploadFailed = processMultiFileUpload(session, files, appFlag.BucketName, appFlag.ObjectPath, appFlag.ContentType, appFlag.Workers, appFlag.FileTimeoutValue)
 		} else {
 			objPath := appFlag.ObjectPath
 			if objPath == "" {
 				objPath = deriveObjectPath(files[0])
 				LogInfo.Println("Object path derived from file path: " + objPath)
 			}
-			if err := uploadFile(storageUnderlyingDataObject, files[0], appFlag.BucketName, objPath, appFlag.ContentType, false, 0); err != nil {
-				LogErr.Fatalln("FATAL ERROR: " + err.Error())
+			if err := uploadFile(session, files[0], appFlag.BucketName, objPath, appFlag.ContentType, false, 0); err != nil {
+				LogErr.Fatalln(err.Error())
 			}
 		}
-	} else if strings.EqualFold(appFlag.ActionType, Download) {
+	} else if appFlag.ActionType == Download {
 		objPath := appFlag.ObjectPath
 		if objPath == "" {
 			objPath = deriveObjectPath(files[0])
 			LogInfo.Println("Object path derived from file path: " + objPath)
 		}
-		downloadFile(storageUnderlyingDataObject, files[0], appFlag.BucketName, objPath)
+		downloadFile(session, files[0], appFlag.BucketName, objPath)
 	} else {
-		LogErr.Fatalln("FATAL ERROR: Wrong action parameter specified!")
+		LogErr.Fatalln("Wrong action parameter specified!")
 	}
 
 	duration := fmt.Sprintf("%.1f", time.Since(start).Seconds())
-	LogAlways.Println("BYE MSG: All done in " + duration + "s, bye!")
-
 	if uploadFailed > 0 {
+		LogAlways.Printf("BYE MSG: Completed with %d failure(s) in %ss.", uploadFailed, duration)
 		os.Exit(1)
 	}
+	LogAlways.Println("BYE MSG: All done in " + duration + "s, bye!")
+
 }
 
 func createContext(timeoutValue int) (context.Context, context.CancelFunc) {
@@ -299,6 +332,8 @@ func createContext(timeoutValue int) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, time.Second*time.Duration(timeoutValue))
 }
 
+// createClient builds the GCS client. storage.NewClient is a local constructor
+// (no network I/O), so it is not wrapped in withRetry.
 func createClient(ctx context.Context, publicRequest bool, keyPath string) *storage.Client {
 
 	var clientOption option.ClientOption
@@ -310,7 +345,7 @@ func createClient(ctx context.Context, publicRequest bool, keyPath string) *stor
 
 	client, err := storage.NewClient(ctx, clientOption)
 	if err != nil {
-		LogErr.Fatalln("FATAL ERROR: Cannot create new storage client! (" + err.Error() + ")")
+		LogErr.Fatalln("Cannot create new storage client! (" + err.Error() + ")")
 	}
 
 	return client
@@ -328,8 +363,8 @@ func deriveMultiFileObjectPath(objectPath, filePath string) string {
 	return deriveObjectPath(filePath)
 }
 
-func processMultiFileUpload(storageData *storageUnderlyingDataStruct, files []string, bucketName, objectPath, contentType string, workers uint, fileTimeout int) int {
-	LogInfo.Println(fmt.Sprintf("Multi-file upload: %d files detected.", len(files)))
+func processMultiFileUpload(session *gcsSession, files []string, bucketName, objectPath, contentType string, workers uint, fileTimeout int) int {
+	LogInfo.Printf("Multi-file upload: %d files detected.", len(files))
 
 	if objectPath == "" {
 		LogInfo.Println("Object path not specified, each file's path will be used as its object path.")
@@ -338,13 +373,12 @@ func processMultiFileUpload(storageData *storageUnderlyingDataStruct, files []st
 	}
 
 	if appFlag.ExtraChecks {
-		bkt := storageData.client.Bucket(bucketName)
-		_, err := bkt.Attrs(storageData.ctx)
-		if err != nil {
+		bkt := session.client.Bucket(bucketName)
+		if err := checkBucketExists(session.ctx, bkt); err != nil {
 			if errors.Is(err, storage.ErrBucketNotExist) {
-				LogErr.Fatalln("FATAL ERROR: Bucket does not exist!")
+				LogErr.Fatalln("Bucket does not exist!")
 			} else {
-				LogErr.Fatalln("FATAL ERROR: Cannot fetch bucket info! (" + err.Error() + ")")
+				LogErr.Fatalln("Cannot fetch bucket info! (" + err.Error() + ")")
 			}
 		}
 	}
@@ -355,12 +389,12 @@ func processMultiFileUpload(storageData *storageUnderlyingDataStruct, files []st
 		LogInfo.Println("Processing files sequentially...")
 		for _, f := range files {
 			objPath := deriveMultiFileObjectPath(objectPath, f)
-			if err := uploadFile(storageData, f, bucketName, objPath, contentType, true, fileTimeout); err != nil {
+			if err := uploadFile(session, f, bucketName, objPath, contentType, true, fileTimeout); err != nil {
 				failed++
 			}
 		}
 	} else {
-		LogInfo.Println(fmt.Sprintf("Processing files concurrently with %d workers...", workers))
+		LogInfo.Printf("Processing files concurrently with %d workers...", workers)
 
 		jobs := make(chan string, len(files))
 		var mu sync.Mutex
@@ -370,7 +404,7 @@ func processMultiFileUpload(storageData *storageUnderlyingDataStruct, files []st
 			wg.Go(func() {
 				for f := range jobs {
 					objPath := deriveMultiFileObjectPath(objectPath, f)
-					if err := uploadFile(storageData, f, bucketName, objPath, contentType, true, fileTimeout); err != nil {
+					if err := uploadFile(session, f, bucketName, objPath, contentType, true, fileTimeout); err != nil {
 						mu.Lock()
 						failed++
 						mu.Unlock()
@@ -387,18 +421,18 @@ func processMultiFileUpload(storageData *storageUnderlyingDataStruct, files []st
 	}
 
 	succeeded := len(files) - failed
-	LogInfo.Println(fmt.Sprintf("Multi-file upload complete: %d/%d succeeded, %d failed.", succeeded, len(files), failed))
+	LogInfo.Printf("Multi-file upload complete: %d/%d succeeded, %d failed.", succeeded, len(files), failed)
 
 	if failed > 0 {
-		LogWarn.Println(fmt.Sprintf("%d file(s) failed to upload. Check warnings above for details.", failed))
+		LogWarn.Printf("%d file(s) failed to upload. Check warnings above for details.", failed)
 	}
 	return failed
 }
 
-func uploadFile(storageUnderlyingDataObject *storageUnderlyingDataStruct, filePath string, bucketName string, objectPath string, contentType string, multiFile bool, fileTimeout int) error {
+func uploadFile(session *gcsSession, filePath string, bucketName string, objectPath string, contentType string, multiFile bool, fileTimeout int) error {
 
-	ctx := storageUnderlyingDataObject.ctx
-	client := storageUnderlyingDataObject.client
+	ctx := session.ctx
+	client := session.client
 
 	if fileTimeout > 0 {
 		var cancel context.CancelFunc
@@ -408,173 +442,62 @@ func uploadFile(storageUnderlyingDataObject *storageUnderlyingDataStruct, filePa
 
 	fileRoot, err := os.OpenRoot(filepath.Dir(filePath))
 	if err != nil {
-		msg := fmt.Sprintf("Cannot open directory for file %s! (%s)", filePath, err.Error())
-		if multiFile {
-			LogWarn.Println("WARNING: " + msg + " Skipping.")
-			return err
-		}
-		LogErr.Fatalln("FATAL ERROR: " + msg)
+		return handleUploadError(multiFile, fmt.Sprintf("Cannot open directory for file %s! (%s)", filePath, err.Error()), err)
 	}
 	defer fileRoot.Close()
+
 	file, err := fileRoot.Open(filepath.Base(filePath))
 	if err != nil {
-		msg := fmt.Sprintf("Cannot open file %s! (%s)", filePath, err.Error())
-		if multiFile {
-			LogWarn.Println("WARNING: " + msg + " Skipping.")
-			return err
-		}
-		LogErr.Fatalln("FATAL ERROR: " + msg)
+		return handleUploadError(multiFile, fmt.Sprintf("Cannot open file %s! (%s)", filePath, err.Error()), err)
 	}
 	defer file.Close()
 
 	fileInfo, err := file.Stat()
 	if err != nil {
-		msg := fmt.Sprintf("Cannot stat file %s! (%s)", filePath, err.Error())
-		if multiFile {
-			LogWarn.Println("WARNING: " + msg + " Skipping.")
-			return err
-		}
-		LogErr.Fatalln("FATAL ERROR: " + msg)
+		return handleUploadError(multiFile, fmt.Sprintf("Cannot stat file %s! (%s)", filePath, err.Error()), err)
 	}
 	if !fileInfo.Mode().IsRegular() {
-		msg := fmt.Sprintf("Path %s is not a regular file! Only regular files can be uploaded.", filePath)
-		if multiFile {
-			LogWarn.Println("WARNING: " + msg + " Skipping.")
-			return fmt.Errorf("%s", msg)
-		}
-		LogErr.Fatalln("FATAL ERROR: " + msg)
-	}
-
-	localCRC32C, err := computeCRC32C(file)
-	if err != nil {
-		msg := fmt.Sprintf("Cannot compute CRC32C for %s! (%s)", filePath, err.Error())
-		if multiFile {
-			LogWarn.Println("WARNING: " + msg + " Skipping.")
-			return err
-		}
-		LogErr.Fatalln("FATAL ERROR: " + msg)
-	}
-
-	if _, err = file.Seek(0, io.SeekStart); err != nil {
-		msg := fmt.Sprintf("Cannot seek file %s! (%s)", filePath, err.Error())
-		if multiFile {
-			LogWarn.Println("WARNING: " + msg + " Skipping.")
-			return err
-		}
-		LogErr.Fatalln("FATAL ERROR: " + msg)
+		return handleUploadError(multiFile, fmt.Sprintf("Path %s is not a regular file! Only regular files can be uploaded.", filePath), nil)
 	}
 
 	bkt := client.Bucket(bucketName)
 	obj := bkt.Object(objectPath)
+	compress := !appFlag.NoCompress
 
+	// ExtraChecks pre-flight: verify bucket/object state before reading the file.
 	if appFlag.ExtraChecks {
 		if !multiFile {
-			_, err = bkt.Attrs(ctx)
-			if err != nil {
+			if err = checkBucketExists(ctx, bkt); err != nil {
 				if errors.Is(err, storage.ErrBucketNotExist) {
-					LogErr.Fatalln("FATAL ERROR: Bucket does not exist!")
+					LogErr.Fatalln("Bucket does not exist!")
 				} else {
-					LogErr.Fatalln("FATAL ERROR: Cannot fetch bucket info! (" + err.Error() + ")")
+					LogErr.Fatalln("Cannot fetch bucket info! (" + err.Error() + ")")
 				}
 			}
 		}
 
-		objAttrs, err := obj.Attrs(ctx)
+		var objAttrs *storage.ObjectAttrs
+		err = withRetry(appFlag.RetryCount, func() error {
+			var e error
+			objAttrs, e = obj.Attrs(ctx)
+			return e
+		})
 		if err != nil {
 			if errors.Is(err, storage.ErrObjectNotExist) {
 				LogInfo.Println("Object does not exist, going to create a new one: " + objectPath)
 			} else {
-				msg := fmt.Sprintf("Cannot fetch object info for %s! (%s)", objectPath, err.Error())
-				if multiFile {
-					LogWarn.Println("WARNING: " + msg + " Skipping.")
-					return err
-				}
-				LogErr.Fatalln("FATAL ERROR: " + msg)
+				return handleUploadError(multiFile, fmt.Sprintf("Cannot fetch object info for %s! (%s)", objectPath, err.Error()), err)
 			}
 		} else {
-			LogWarn.Println(fmt.Sprintf("WARNING: Object %s exists, going to override it! (SIZE: %d, CRC32C: %d, GENERATION: %d)", objectPath, objAttrs.Size, objAttrs.CRC32C, objAttrs.Generation))
+			LogWarn.Printf("Object %s exists, going to override it! (SIZE: %d, CRC32C: %d, GENERATION: %d)", objectPath, objAttrs.Size, objAttrs.CRC32C, objAttrs.Generation)
 		}
 	}
 
-	compress := !appFlag.NoCompress
-
-	writer := obj.NewWriter(ctx)
-
-	if contentType != "" {
-		writer.ContentType = contentType
-	}
-
-	if compress {
-		writer.ContentEncoding = "gzip"
-		writer.Metadata = map[string]string{
-			"x-original-crc32c": strconv.FormatUint(uint64(localCRC32C), 10),
-		}
-	} else {
-		writer.SendCRC32C = true
-		writer.CRC32C = localCRC32C
-	}
-
-	bufReader := bufio.NewReaderSize(file, getBufferSizeBytes())
-	var bytesWritten int64
-
-	if compress {
-		gzWriter := gzip.NewWriter(writer)
-		bytesWritten, err = io.Copy(gzWriter, bufReader)
-		if err != nil {
-			closeWithWarn(gzWriter, "gzip writer")
-			closeWithWarn(writer, "storage writer")
-			msg := fmt.Sprintf("Cannot copy file %s to bucket! (%s)", filePath, err.Error())
-			if multiFile {
-				LogWarn.Println("WARNING: " + msg)
-				return err
-			}
-			LogErr.Fatalln("FATAL ERROR: " + msg)
-		}
-		if err = gzWriter.Close(); err != nil {
-			closeWithWarn(writer, "storage writer")
-			msg := fmt.Sprintf("Cannot finalize gzip stream for %s! (%s)", filePath, err.Error())
-			if multiFile {
-				LogWarn.Println("WARNING: " + msg)
-				return err
-			}
-			LogErr.Fatalln("FATAL ERROR: " + msg)
-		}
-	} else {
-		bytesWritten, err = io.Copy(writer, bufReader)
-		if err != nil {
-			closeWithWarn(writer, "storage writer")
-			msg := fmt.Sprintf("Cannot copy file %s to bucket! (%s)", filePath, err.Error())
-			if multiFile {
-				LogWarn.Println("WARNING: " + msg)
-				return err
-			}
-			LogErr.Fatalln("FATAL ERROR: " + msg)
-		}
-	}
-
-	err = writer.Close()
+	// Compute CRC32C after pre-flight so we don't read the entire file when the
+	// bucket/object checks would have already aborted.
+	localCRC32C, err := computeCRC32C(file)
 	if err != nil {
-		msg := fmt.Sprintf("Cannot write file %s to bucket! (%s)", filePath, err.Error())
-		if multiFile {
-			LogWarn.Println("WARNING: " + msg)
-			return err
-		}
-		LogErr.Fatalln("FATAL ERROR: " + msg)
-	}
-
-	if appFlag.ExtraChecks {
-		objAttrsNew, err := obj.Attrs(ctx)
-		if err != nil {
-			LogWarn.Println(fmt.Sprintf("WARNING: Upload succeeded but cannot verify object info for %s. (%s)", objectPath, err.Error()))
-		} else {
-			compressTag := ""
-			if compress {
-				compressTag = ", gzip-compressed"
-			}
-
-			LogInfo.Println(fmt.Sprintf("SUCCESS: %s uploaded to %s. (Original Bytes: %d, Object SIZE: %d, Object CRC32C: %d, Local CRC32C: %d, GENERATION: %d%s)", filePath, objectPath, bytesWritten, objAttrsNew.Size, objAttrsNew.CRC32C, localCRC32C, objAttrsNew.Generation, compressTag))
-			return nil
-		}
+		return handleUploadError(multiFile, fmt.Sprintf("Cannot compute CRC32C for %s! (%s)", filePath, err.Error()), err)
 	}
 
 	compressTag := ""
@@ -582,21 +505,87 @@ func uploadFile(storageUnderlyingDataObject *storageUnderlyingDataStruct, filePa
 		compressTag = ", gzip-compressed"
 	}
 
-	LogInfo.Println(fmt.Sprintf("SUCCESS: %s uploaded to %s. (Written Bytes: %d, Local CRC32C: %d%s)", filePath, objectPath, bytesWritten, localCRC32C, compressTag))
+	var bytesWritten int64
+	err = withRetry(appFlag.RetryCount, func() error {
+		if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
+			return seekErr
+		}
+
+		// Use a per-attempt context so that a failed attempt's in-flight HTTP
+		// request is cancelled immediately rather than committing partial data.
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+		defer attemptCancel()
+
+		w := obj.NewWriter(attemptCtx)
+		if contentType != "" {
+			w.ContentType = contentType
+		}
+		if compress {
+			w.ContentEncoding = "gzip"
+			w.Metadata = map[string]string{
+				"x-original-crc32c": strconv.FormatUint(uint64(localCRC32C), 10),
+			}
+		} else {
+			w.SendCRC32C = true
+			w.CRC32C = localCRC32C
+		}
+
+		bufReader := bufio.NewReaderSize(file, getBufferSizeBytes())
+
+		if compress {
+			gzWriter := gzip.NewWriter(w)
+			var copyErr error
+			bytesWritten, copyErr = io.Copy(gzWriter, bufReader)
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr := gzWriter.Close(); closeErr != nil {
+				return closeErr
+			}
+		} else {
+			var copyErr error
+			bytesWritten, copyErr = io.Copy(w, bufReader)
+			if copyErr != nil {
+				return copyErr
+			}
+		}
+
+		return w.Close()
+	})
+	if err != nil {
+		return handleUploadError(multiFile, fmt.Sprintf("Cannot write file %s to bucket! (%s)", filePath, err.Error()), err)
+	}
+
+	if appFlag.ExtraChecks {
+		var objAttrsNew *storage.ObjectAttrs
+		err = withRetry(appFlag.RetryCount, func() error {
+			var e error
+			objAttrsNew, e = obj.Attrs(ctx)
+			return e
+		})
+		if err != nil {
+			LogWarn.Printf("Upload succeeded but cannot verify object info for %s. (%s)", objectPath, err.Error())
+		} else {
+			LogInfo.Printf("SUCCESS: %s uploaded to %s. (Original Bytes: %d, Object SIZE: %d, Object CRC32C: %d, Local CRC32C: %d, GENERATION: %d%s)", filePath, objectPath, bytesWritten, objAttrsNew.Size, objAttrsNew.CRC32C, localCRC32C, objAttrsNew.Generation, compressTag)
+			return nil
+		}
+	}
+
+	LogInfo.Printf("SUCCESS: %s uploaded to %s. (Original Bytes: %d, Local CRC32C: %d%s)", filePath, objectPath, bytesWritten, localCRC32C, compressTag)
 	return nil
 
 }
 
-func downloadFile(storageUnderlyingDataObject *storageUnderlyingDataStruct, filePath string, bucketName string, objectPath string) {
+func downloadFile(session *gcsSession, filePath string, bucketName string, objectPath string) {
 
-	ctx := storageUnderlyingDataObject.ctx
-	client := storageUnderlyingDataObject.client
+	ctx := session.ctx
+	client := session.client
 
 	if info, err := os.Stat(filePath); err == nil {
 		if info.Mode().IsRegular() {
-			LogWarn.Println("WARNING: File exists, going to override it! (Existing File's SIZE: " + strconv.FormatInt(info.Size(), 10) + ")")
+			LogWarn.Println("File exists, going to override it! (Existing File's SIZE: " + strconv.FormatInt(info.Size(), 10) + ")")
 		} else {
-			LogWarn.Println("WARNING: Path exists but not a regular file!")
+			LogWarn.Println("Path exists but not a regular file!")
 		}
 	}
 
@@ -606,85 +595,109 @@ func downloadFile(storageUnderlyingDataObject *storageUnderlyingDataStruct, file
 	var objAttrs *storage.ObjectAttrs
 
 	if appFlag.ExtraChecks {
-		_, err := bkt.Attrs(ctx)
-		if err != nil {
+		if err := checkBucketExists(ctx, bkt); err != nil {
 			if errors.Is(err, storage.ErrBucketNotExist) {
-				LogErr.Fatalln("FATAL ERROR: Bucket does not exist!")
+				LogErr.Fatalln("Bucket does not exist!")
 			} else {
-				LogErr.Fatalln("FATAL ERROR: Cannot fetch bucket info! (" + err.Error() + ")")
+				LogErr.Fatalln("Cannot fetch bucket info! (" + err.Error() + ")")
 			}
 		}
 
-		var attrErr error
-		objAttrs, attrErr = obj.Attrs(ctx)
-		if attrErr != nil {
-			if errors.Is(attrErr, storage.ErrObjectNotExist) {
-				LogErr.Fatalln("FATAL ERROR: Object does not exist!")
+		if err := withRetry(appFlag.RetryCount, func() error {
+			var e error
+			objAttrs, e = obj.Attrs(ctx)
+			return e
+		}); err != nil {
+			if errors.Is(err, storage.ErrObjectNotExist) {
+				LogErr.Fatalln("Object does not exist!")
 			} else {
-				LogErr.Fatalln("FATAL ERROR: Cannot fetch object info! (" + attrErr.Error() + ")")
+				LogErr.Fatalln("Cannot fetch object info! (" + err.Error() + ")")
 			}
 		}
 
-		LogInfo.Println(fmt.Sprintf("Object info: SIZE: %d, CRC32C: %d, GENERATION: %d, ContentEncoding: %s", objAttrs.Size, objAttrs.CRC32C, objAttrs.Generation, objAttrs.ContentEncoding))
-	}
-
-	reader, err := obj.ReadCompressed(true).NewReader(ctx)
-	if err != nil {
-		LogErr.Fatalln("FATAL ERROR: Cannot create new reader! (" + err.Error() + ")")
-	}
-
-	compressed := strings.EqualFold(reader.Attrs.ContentEncoding, "gzip")
-	if compressed {
-		LogInfo.Println("Object is gzip-compressed, decompressing during download.")
+		LogInfo.Printf("Object info: SIZE: %d, CRC32C: %d, GENERATION: %d, ContentEncoding: %s", objAttrs.Size, objAttrs.CRC32C, objAttrs.Generation, objAttrs.ContentEncoding)
 	}
 
 	fileRoot, err := os.OpenRoot(filepath.Dir(filePath))
 	if err != nil {
-		closeWithWarn(reader, "storage reader")
-		LogErr.Fatalln("FATAL ERROR: Cannot open directory for output file! (" + err.Error() + ")")
+		LogErr.Fatalln("Cannot open directory for output file! (" + err.Error() + ")")
 	}
 	defer fileRoot.Close()
 	file, err := fileRoot.Create(filepath.Base(filePath))
 	if err != nil {
-		closeWithWarn(reader, "storage reader")
-		LogErr.Fatalln("FATAL ERROR: Cannot create requested file! (" + err.Error() + ")")
+		LogErr.Fatalln("Cannot create requested file! (" + err.Error() + ")")
 	}
 	defer file.Close()
 
 	crcHash := crc32.New(crc32cTable)
+	var bytesWritten int64
+	var compressed bool
 
-	var src io.Reader = reader
-	if compressed {
-		gzReader, gzErr := gzip.NewReader(reader)
-		if gzErr != nil {
-			closeWithWarn(reader, "storage reader")
-			closeWithWarn(file, "output file")
-			if removeErr := os.Remove(filePath); removeErr != nil {
-				LogWarn.Println("WARNING: Cannot delete file after error: " + removeErr.Error())
-			}
-			LogErr.Fatalln("FATAL ERROR: Cannot decompress gzip data! (" + gzErr.Error() + ")")
+	err = withRetry(appFlag.RetryCount, func() error {
+		// Reset file and hash state at the start of every attempt (no-op on first).
+		if _, e := file.Seek(0, io.SeekStart); e != nil {
+			return e
 		}
-		defer gzReader.Close()
-		src = gzReader
-	}
+		if e := file.Truncate(0); e != nil {
+			return e
+		}
+		crcHash.Reset()
 
-	teeReader := io.TeeReader(src, crcHash)
-	bufWriter := bufio.NewWriterSize(file, getBufferSizeBytes())
+		// Per-attempt context so a failed attempt's HTTP request is aborted cleanly.
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+		defer attemptCancel()
 
-	bytesWritten, err := io.Copy(bufWriter, teeReader)
+		r, e := obj.ReadCompressed(true).NewReader(attemptCtx)
+		if e != nil {
+			return e
+		}
+
+		// Determine compression from object metadata.
+		// ReadCompressed(true) fetches the raw (possibly gzip) stream; we decompress
+		// manually so that the CRC is computed over the final uncompressed bytes.
+		compressed = strings.EqualFold(r.Attrs.ContentEncoding, "gzip")
+
+		var src io.Reader = r
+		var gzRdr *gzip.Reader
+		if compressed {
+			gzRdr, e = gzip.NewReader(r)
+			if e != nil {
+				closeWithWarn(r, "storage reader")
+				return e
+			}
+			src = gzRdr
+		}
+
+		teeReader := io.TeeReader(src, crcHash)
+		bufWriter := bufio.NewWriterSize(file, getBufferSizeBytes())
+
+		bytesWritten, e = io.Copy(bufWriter, teeReader)
+		if e != nil {
+			closeWithWarn(r, "storage reader")
+			return e
+		}
+
+		if e = bufWriter.Flush(); e != nil {
+			closeWithWarn(r, "storage reader")
+			return e
+		}
+
+		// Close gzRdr before r to maintain proper ownership order.
+		if gzRdr != nil {
+			if e = gzRdr.Close(); e != nil {
+				closeWithWarn(r, "storage reader")
+				return e
+			}
+		}
+
+		return r.Close()
+	})
 	if err != nil {
-		closeWithWarn(reader, "storage reader")
-		LogErr.Fatalln("FATAL ERROR: Cannot copy object from bucket! (" + err.Error() + ")")
-	}
-
-	if err = bufWriter.Flush(); err != nil {
-		closeWithWarn(reader, "storage reader")
-		LogErr.Fatalln("FATAL ERROR: Cannot flush buffer to file! (" + err.Error() + ")")
-	}
-
-	err = reader.Close()
-	if err != nil {
-		LogErr.Fatalln("FATAL ERROR: Cannot read object from bucket! (" + err.Error() + ")")
+		closeWithWarn(file, "output file")
+		if removeErr := os.Remove(filePath); removeErr != nil {
+			LogWarn.Println("Cannot delete file after error: " + removeErr.Error())
+		}
+		LogErr.Fatalln("Cannot read object from bucket! (" + err.Error() + ")")
 	}
 
 	downloadedCRC32C := crcHash.Sum32()
@@ -695,28 +708,28 @@ func downloadFile(storageUnderlyingDataObject *storageUnderlyingDataStruct, file
 			if ok {
 				origVal, parseErr := strconv.ParseUint(origStr, 10, 32)
 				if parseErr == nil && uint32(origVal) == downloadedCRC32C {
-					LogInfo.Println(fmt.Sprintf("SUCCESS: Object downloaded and decompressed. (Written Bytes: %d, CRC32C verified: %d)", bytesWritten, downloadedCRC32C))
-			} else if parseErr == nil {
-				closeWithWarn(file, "output file")
-				if removeErr := os.Remove(filePath); removeErr != nil {
-					LogWarn.Println("WARNING: Cannot delete file after CRC32C mismatch: " + removeErr.Error())
-				}
-				LogErr.Fatalln(fmt.Sprintf("FATAL ERROR: CRC32C mismatch! File deleted. (Expected: %d, Got: %d, Written Bytes: %d)", uint32(origVal), downloadedCRC32C, bytesWritten))
+					LogInfo.Printf("SUCCESS: Object downloaded and decompressed. (Written Bytes: %d, CRC32C verified: %d)", bytesWritten, downloadedCRC32C)
+				} else if parseErr == nil {
+					closeWithWarn(file, "output file")
+					if removeErr := os.Remove(filePath); removeErr != nil {
+						LogWarn.Println("Cannot delete file after CRC32C mismatch: " + removeErr.Error())
+					}
+					LogErr.Fatalf("CRC32C mismatch! File deleted. (Expected: %d, Got: %d, Written Bytes: %d)", uint32(origVal), downloadedCRC32C, bytesWritten)
 				} else {
-					LogWarn.Println(fmt.Sprintf("WARNING: Cannot parse original CRC32C from metadata. (Written Bytes: %d, Downloaded CRC32C: %d)", bytesWritten, downloadedCRC32C))
+					LogWarn.Printf("Cannot parse original CRC32C from metadata. (Written Bytes: %d, Downloaded CRC32C: %d)", bytesWritten, downloadedCRC32C)
 				}
 			} else {
-				LogInfo.Println(fmt.Sprintf("SUCCESS: Object downloaded and decompressed. (Written Bytes: %d, CRC32C: %d, no original checksum in metadata to validate)", bytesWritten, downloadedCRC32C))
+				LogInfo.Printf("SUCCESS: Object downloaded and decompressed. (Written Bytes: %d, CRC32C: %d, no original checksum in metadata to validate)", bytesWritten, downloadedCRC32C)
 			}
 		} else {
 			if objAttrs.CRC32C == downloadedCRC32C {
-				LogInfo.Println(fmt.Sprintf("SUCCESS: Object downloaded. (Written Bytes: %d, CRC32C verified: %d)", bytesWritten, downloadedCRC32C))
+				LogInfo.Printf("SUCCESS: Object downloaded. (Written Bytes: %d, CRC32C verified: %d)", bytesWritten, downloadedCRC32C)
 			} else {
 				closeWithWarn(file, "output file")
 				if removeErr := os.Remove(filePath); removeErr != nil {
-					LogWarn.Println("WARNING: Cannot delete file after CRC32C mismatch: " + removeErr.Error())
+					LogWarn.Println("Cannot delete file after CRC32C mismatch: " + removeErr.Error())
 				}
-				LogErr.Fatalln(fmt.Sprintf("FATAL ERROR: CRC32C mismatch! File deleted. (Expected: %d, Got: %d, Written Bytes: %d)", objAttrs.CRC32C, downloadedCRC32C, bytesWritten))
+				LogErr.Fatalf("CRC32C mismatch! File deleted. (Expected: %d, Got: %d, Written Bytes: %d)", objAttrs.CRC32C, downloadedCRC32C, bytesWritten)
 			}
 		}
 	} else {
@@ -724,7 +737,7 @@ func downloadFile(storageUnderlyingDataObject *storageUnderlyingDataStruct, file
 		if compressed {
 			decompTag = " and decompressed"
 		}
-		LogInfo.Println(fmt.Sprintf("SUCCESS: Object downloaded%s. (Written Bytes: %d, CRC32C: %d)", decompTag, bytesWritten, downloadedCRC32C))
+		LogInfo.Printf("SUCCESS: Object downloaded%s. (Written Bytes: %d, CRC32C: %d)", decompTag, bytesWritten, downloadedCRC32C)
 	}
 
 }
