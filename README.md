@@ -1,6 +1,6 @@
 # GCP-Bucket-Loader
 
-A fast, lightweight CLI tool for uploading and downloading files to/from Google Cloud Storage. Built in Go with gzip compression, CRC32C integrity checks, buffered I/O, and concurrent multi-file upload support.
+A fast, lightweight CLI tool for uploading and downloading files to/from Google Cloud Storage. Built in Go with gzip compression, CRC32C integrity checks, buffered I/O, concurrent multi-file upload support, and optional retries for transient GCP/network errors.
 
 ---
 
@@ -31,6 +31,7 @@ make clean      # remove the bin/ directory
 | `-timeout` | int | — | Total operation timeout in seconds. Omit or pass `0` for **no** overall limit (runs until completion). |
 | `-file-timeout` | int | `0` | Per-file timeout in seconds for multi-file uploads. `0` = no per-file limit; `-timeout` still caps the whole run when set. |
 | `-workers` | uint | `0` | Concurrent workers for multi-file upload. `0` = sequential. |
+| `-retry` | int | `0` | Extra attempts after a failed GCP/network operation. `0` = no retries; with `-retry N`, each retried operation runs up to **N + 1** times total, waiting **1 second** between attempts. See [Retry behaviour](#retry-behaviour). |
 
 ---
 
@@ -47,6 +48,21 @@ For public buckets, skip authentication entirely:
 ```bash
 -public
 ```
+
+---
+
+## Retry behaviour
+
+When `-retry` is greater than `0`, the tool re-runs failed **remote** steps instead of failing immediately:
+
+- **Bucket checks** (`BucketHandle.Attrs`) when `-extra` triggers them, including the initial multi-file upload check.
+- **Object metadata** (`ObjectHandle.Attrs`) when `-extra` is enabled (upload pre-flight, post-upload verification, download pre-flight).
+- **Upload**: opening the writer, streaming data, and closing the object (each full upload is retried as a unit; the local file is seeked back to the start on each attempt).
+- **Download**: opening the reader, streaming to disk, and closing (the local partial file is truncated and the CRC state reset on each attempt).
+
+Retries use a **1 second** pause between attempts and log a **WARNING** with the attempt number and error.
+
+**Not retried:** client construction (`storage.NewClient`). If that fails, the process exits immediately.
 
 ---
 
@@ -127,6 +143,18 @@ GCP-Bucket-Loader -action upload -bucket my-bucket -key sa.json \
   -file large-file.tar.gz -buffer 1024 -timeout 300
 ```
 
+### Retries for flaky networks
+
+Use `-retry` to tolerate short outages or rate limits (each value is the number of *extra* attempts after the first failure):
+
+```bash
+GCP-Bucket-Loader -action upload -bucket my-bucket -key sa.json \
+  -file reports/q1.csv -retry 3
+
+GCP-Bucket-Loader -action download -bucket my-bucket -key sa.json \
+  -file ./local/report.csv -object reports/report.csv -retry 5
+```
+
 ---
 
 ## Compression & Integrity
@@ -144,7 +172,8 @@ GCP-Bucket-Loader -action upload -bucket my-bucket -key sa.json \
 - Per-file failures are logged as warnings and do not abort the remaining uploads.
 - `-workers 0` (default) processes files sequentially.
 - `-workers N` (N > 0) launches a pool of N goroutines.
-- `-file-timeout` and `-workers` flags are silently noted but ignored for single-file operations.
+- For single-file operations, `-file-timeout` and `-workers` are ignored.
+- `-retry` applies to upload and download (including per-file uploads in multi-file mode).
 
 ---
 
@@ -157,4 +186,4 @@ GCP-Bucket-Loader -action upload -bucket my-bucket -key sa.json \
 | Object not found on download | Fatal exit |
 | CRC32C mismatch on download | Deletes file, fatal exit |
 | Per-file upload failure (multi) | Warning logged, continues |
-| All uploads complete with failures | Summary warning at the end |
+| All uploads complete with failures (multi-file) | Completion banner reports failure count, process exits with code **1** |
